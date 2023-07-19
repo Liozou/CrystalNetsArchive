@@ -4,12 +4,11 @@ using Base.Threads
 CrystalNets.toggle_warning(false)
 CrystalNets.toggle_export(false)
 
-import CrystalNets: periodic_distance, expand_symmetry, Cell, CIF
+import CrystalNets: periodic_distance, expand_symmetry, Cell, CIF, export_arc
 
 function getrcsr(n)
     rcsr = String(HTTP.get("http://rcsr.anu.edu.au/data/$(n)dall.txt").body)
-    @assert startswith(rcsr, "start")
-    return split(rcsr, r"(\r\n|\n)")
+    return split(rcsr[match(r"start", rcsr).offset:end], r"(\r\n|\n)")
 end
 
 const rcsr3D = getrcsr(3)
@@ -134,8 +133,9 @@ function nearest_neighbors(x, poss, dpos, mat, ε, round_i, maxsize=6)
         src === nothing && continue
         dst = get(dpos, round.(otherpos .- ofsother; digits=round_i), nothing)
         dst === nothing && continue
+        src == dst && ofsother == ofspos && continue # avoid loop
         edg = PeriodicEdge3D(src, dst, ofsother .- ofspos)
-        if PeriodicGraphs.isindirectedge(edg)
+        if !PeriodicGraphs.isdirectedge(edg)
             edg = reverse(edg)
         end
         push!(ret, edg)
@@ -356,13 +356,13 @@ function extract_rcsr_data(rcsr=rcsr3D)
             _symb, _spgroup = split(rcsr[i])
             spgroup = parse(Int, _spgroup)
             symb = filter(x -> x != '(' && x != ')', _symb)
-            hall = get(CrystalNets.SPACE_GROUP_HM, symb, 0)
+            hall = get(CrystalNets.PeriodicGraphEmbeddings.SPACE_GROUP_HM, symb, 0)
             if hall == 0
-                hall = CrystalNets.SPACE_GROUP_IT[spgroup]
+                hall = CrystalNets.PeriodicGraphEmbeddings.SPACE_GROUP_IT[spgroup]
                 push!(symmetry_issues, (name, _symb, spgroup))
                 # @info "Invalid symmetry $symb for $name (defaulting to $hall from spgroup $spgroup)"
-            elseif hall != CrystalNets.SPACE_GROUP_IT[spgroup]
-                @warn "symb $symb leads to hall number $hall but spgroup $spgroup leads to $(CrystalNets.SPACE_GROUP_IT[spgroup])"
+            elseif hall != CrystalNets.PeriodicGraphEmbeddings.SPACE_GROUP_IT[spgroup]
+                @warn "symb $symb leads to hall number $hall but spgroup $spgroup leads to $(CrystalNets.PeriodicGraphEmbeddings.SPACE_GROUP_IT[spgroup])"
             end
 
             i += 1
@@ -401,7 +401,7 @@ function extract_rcsr_data(rcsr=rcsr3D)
             for v in 1:numv
                 seq = parse.(Int, split(rcsr[i]))
                 @assert length(seq) == 11
-                name ∈ ("xxv", "rpa", "qyc") || @assert seq[1] == coordination[v]
+                name ∈ ("xxv", "rpa", "qyc", "ecz", "ocf", "szp") || @assert seq[1] == coordination[v]
                 pop!(seq)
                 seqs[v] = seq
                 i += 1
@@ -426,7 +426,7 @@ function extract_rcsr_data(rcsr=rcsr3D)
                 push!(seqss, seqs)
             end
 
-            while i < length(rcsr) && rcsr[i] != "start"
+            while i < length(rcsr) && !occursin("start", rcsr[i])
                 i += 1
             end
             i += 1
@@ -475,13 +475,34 @@ function extract_graphs(rcsr=rcsr3D)
     return Dict(ret), names[_failed], names[_errored], symmetry_issues
 end
 
+"""
+Create a new .arc from the successful parsed topologies
+"""
+function export_new_archive(path, rcsr=rcsr3D)
+    archive, failed, errored, symms = extract_graphs(rcsr)
+    list_archive = collect(archive)
+    n = length(list_archive)
+    ret = Vector{Tuple{String,String}}(undef, n)
+    keep = trues(n)
+    @threads for i in 1:n
+        id, graph = list_archive[i]
+        g = topological_genome(CrystalNet(graph))
+        keep[i] = !g.unstable && isempty(g.error)
+        ret[i] = (string(PeriodicGraph(g)), id)
+    end
+    keepat!(ret, keep)
+    export_arc(path, ret)
+end
+
+# Main entrypoint: export_new_archive("/tmp/rcsr.arc", rcsr3D)
+# then diff with the current rcsr.arc
 
 
 # Utility for comparing with EPINET
 
 function altnamesrcsr(rcsr=rcsr3D)
     ret = Pair{String,Vector{String}}[]
-    @assert rcsr[1] == "start"
+    @assert rcsr[1] == "start" || rcsr[1] == " start"
     i = 1
     flag = true
     while flag
@@ -517,7 +538,7 @@ function altnamesrcsr(rcsr=rcsr3D)
                 break
             end
             l = rcsr[i]
-            l == "start" && break
+            occursin(l, "start") && break
         end
     end
     d = Dict(ret)
