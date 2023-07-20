@@ -72,28 +72,27 @@ end
 """
 Check whether the given graph has the correct list of coordination sequences
 """
-function check_graph(g, seqs)
-    n = length(seqs)
-    nv(g) != n && return false
-    degree(g) != first.(seqs) && return false
-    coord_flag = false
-    for (i, seq) in enumerate(seqs)
-        if coordination_sequence(g, i, 10) != seq
-            coord_flag = true
-            break
-        end
+function check_graph(g, seqs_unique)
+    unique!(sort(degree(g))) != first.(seqs_unique) && return false
+    seqs_set = Set(seqs_unique)
+    for i in 1:nv(g)
+        coordination_sequence(g, i, 10) in seqs_set || return false
     end
-    coord_flag && return false
     return true
 end
 
 """
-Return three lists: ids, dists and closest_pos, where for each index i, i is the index of
-a potential closest neighbour of x such that:
-- ids[i] is the index of the corresponding vertex in list poss
-- dists[i] is the distance between that vertex and x
-- closest_pos[i] is the position of the vertex
-The number of closest neighbours returned is at most maxsize.
+    closest_positions(x, mat, poss, ε, maxsize)
+
+Return three lists: `ids`, `dists` and `closest_pos`, where for each index `i`, `i` is the
+index of a potential closest neighbour of `x` such that:
+- `ids[i]` is the index of the corresponding vertex in list `poss`
+- `dists[i]` is the distance between that vertex and `x`
+- `closest_pos[i]` is the position of the vertex
+
+The number of closest neighbours returned is at most `maxsize`.
+
+Distances between closest neighbours of `x` cannot differ by more than `ε`
 """
 function closest_positions(x, mat, poss, ε, maxsize)
     _, ortho, _safemin = CrystalNets.prepare_periodic_distance_computations(mat)
@@ -134,17 +133,14 @@ function nearest_neighbors(x, poss, dpos, mat, ε, round_i, maxsize=6)
         dst = get(dpos, round.(otherpos .- ofsother; digits=round_i), nothing)
         dst === nothing && continue
         src == dst && ofsother == ofspos && continue # avoid loop
-        edg = PeriodicEdge3D(src, dst, ofsother .- ofspos)
-        if !PeriodicGraphs.isdirectedge(edg)
-            edg = reverse(edg)
-        end
+        edg = directedge(src, dst, ofsother .- ofspos)
         push!(ret, edg)
     end
     sort!(ret); unique!(ret)
     return ret
 end
 
-function try_from_edges(_cife, mat, round_i, pos, dpos, ε, seqs)
+function try_from_edges_old(_cife, mat, round_i, pos, dpos, ε, seqs)
     cife = expand_symmetry(_cife)
     pose = [SVector{3,Float32}(round.(x; digits=round_i+1)) for x in eachcol(cife.pos)]
     @assert allunique(pose)
@@ -174,6 +170,46 @@ function try_from_edges(_cife, mat, round_i, pos, dpos, ε, seqs)
         g = PeriodicGraph(edgs)
         check_graph(g, seqs) && return g
     end
+    return nothing
+end
+
+function try_from_edges_new(cell, poss, poses, dpos, round_i, seqs)
+    mat = Float64.(cell.mat)
+    edgs = PeriodicEdge3D[]
+    npos = NTuple{2,SVector{3,Float32}}[]
+    for pose in poses
+        idxs, _, closest_pos = closest_positions(pose, mat, poss, 3*exp10(-round_i), 2)
+        length(idxs) < 2 && return nothing
+        ofs = floor.(Int, closest_pos[2]) .- floor.(Int, closest_pos[1])
+        idxs[1] == idxs[2] && iszero(ofs) && return nothing
+        push!(edgs, directedge(idxs[1], idxs[2], ofs))
+        push!(npos, (closest_pos[1], closest_pos[2]))
+    end
+    n = length(edgs)
+    for i in 1:n
+        posa, posb = npos[i]
+        for eq in cell.equivalents
+            fulla = eq(posa)
+            ofsa = floor.(Int, fulla)
+            keya = round.(fulla .- ofsa; digits=round_i)
+            if !haskey(dpos, keya)
+                keya = Float32.(precise_round.(fulla .- ofsa, round_i))
+            end
+            haskey(dpos, keya) || return nothing
+            a = dpos[keya]
+            fullb = eq(posb)
+            ofsb = floor.(Int, fullb)
+            keyb = round.(fullb .- ofsb; digits=round_i)
+            if !haskey(dpos, keyb)
+                keyb = Float32.(precise_round.(fullb .- ofsb, round_i))
+            end
+            haskey(dpos, keyb) || return nothing
+            b = dpos[keyb]
+            push!(edgs, PeriodicEdge(a, b, ofsb .- ofsa))
+        end
+    end
+    g = PeriodicGraph(edgs)
+    check_graph(g, seqs) && return g
     return nothing
 end
 
@@ -287,26 +323,35 @@ end
 function determine_graph(_cifv, _cife, cell, _seqs)
     cifv = expand_symmetry(_cifv)
     mat = Float64.(cell.mat)
-    seqs = _seqs[cifv.ids]
-    _pos = Float32.(cifv.pos)
-    pos = _pos
+    # seqs = _seqs[cifv.ids]
+    seqs_unique = unique!(sort(_seqs))
+    _posv = Float32.(cifv.pos)
+    pos = _posv
+    _pose = Float32.(_cife.pos)
+    pose = _pose
     round_i = 1
     while round_i ≤ 8
-        pos = [SVector{3,Float32}(x) for x in eachcol(round.(_pos; digits=round_i))]
+        pos = [SVector{3,Float32}(x) for x in eachcol(round.(_posv; digits=round_i))]
+        pose = [SVector{3,Float32}(x) for x in eachcol(round.(_pose; digits=round_i))]
         round_i += 1
         allunique(pos) && break
     end
-    pos = [SVector{3,Float32}(x) for x in eachcol(precise_round.(_pos, round_i))]
+    pos = [SVector{3,Float32}(x) for x in eachcol(precise_round.(_posv, round_i))]
+    pose = [SVector{3,Float32}(x) for x in eachcol(precise_round.(_pose, round_i))]
     @assert allunique(pos)
     dpos = Dict{SVector{3,Float32},Int}([p => j for (j,p) in enumerate(pos)])
     ε = cbrt(det(mat) / length(cifv.ids))
 
-    # g1 = try_from_closest(_cifv, cifv, mat, round_i, pos, dpos, ε, seqs)
-    g1 = try_from_closest(mat, pos, seqs)
+    # g1 = try_from_closest(_cifv, cifv, mat, round_i, pos, dpos, ε, seqs_unique)
+    g1 = try_from_closest(mat, pos, seqs_unique)
     g1 === nothing || return g1
 
-    g2 = try_from_edges(_cife, mat, round_i, pos, dpos, ε, seqs)
+    pos_precise = [SVector{3,Float32}(x) for x in eachcol(precise_round.(_posv, round_i+1))]
+    g2 = try_from_edges_new(cell, pos_precise, pose, dpos, round_i, seqs_unique)
     g2 === nothing || return g2
+
+    g3 = try_from_edges_old(_cife, mat, round_i, pos, dpos, ε, seqs_unique)
+    g3 === nothing || return g3
 
     return nothing
 end
@@ -367,7 +412,7 @@ function extract_rcsr_data(rcsr=rcsr3D)
 
             i += 1
             a, b, c, α, β, γ = parse.(Float64, split(rcsr[i]))
-            cell = Cell(hall, (a, b, c), (α, β, γ))
+            cell = Cell(hall, (512*a, 512*b, 512*c), (α, β, γ))
 
             i += 1
             numv = parse(Int, rcsr[i])
@@ -435,14 +480,88 @@ function extract_rcsr_data(rcsr=rcsr3D)
             rethrow()
         end
     end
-    return names, cifvs, cifes, cells, seqss, symmetry_issues
+    I = sortperm(names)
+    return names[I], cifvs[I], cifes[I], cells[I], seqss[I], symmetry_issues
 end
 
 
+function deaugment(graph::PeriodicGraph{N}) where N
+    ra = RingAttributions(graph, 2)
+    groups = Vector{PeriodicVertex{N}}[]
+    groupdict = Dict{Int,Tuple{Int,SVector{N,Int}}}()
+    n = nv(graph)
+    I = sort(1:n; by=i->minimum(length, ra[i]; init=0))
+    visited = falses(n)
+    for retry in (false, true)
+        for i in I
+            visited[i] && continue
+            visited[i] = true
+            cycles = [(c, zero(SVector{N,Int})) for c in ra[i]]
+            minclen = minimum(x -> length(x[1]), cycles; init=0)
+            group = PeriodicVertex{N}[PeriodicVertex{N}(i)]
+            push!(groups, group)
+            groupdict[i] = (length(groups), zero(SVector{N,Int}))
+            for (c, ofs) in cycles
+                retry && length(c) > minclen+2 && continue
+                any(((v,_),) -> visited[v] && groupdict[v][1] != length(groups), c) && break
+                for (v, vertex_ofs) in c
+                    visited[v] && continue
+                    visited[v] = true
+                    newofs = vertex_ofs + ofs
+                    groupdict[v] = (length(groups), newofs)
+                    push!(group, PeriodicVertex{N}(v, newofs))
+                    append!(cycles, (c2, newofs) for c2 in ra[v])
+                end
+            end
+        end
+        length(groups) == 1 || break
+        visited = falses(n)
+    end
+    g = PeriodicGraph{N}(length(groups))
+    for (i, group) in enumerate(groups)
+        for (u, ofs_u) in group
+            for (v, ofs_v) in neighbors(graph, u)
+                j, ofs_j = groupdict[v]
+                newofs = ofs_j - ofs_v - ofs_u
+                i == j && iszero(newofs) && continue
+                add_edge!(g, PeriodicEdge{N}(i, j, newofs))
+            end
+        end
+    end
+    g
+end
+
+function look_for_deaugment()
+    ret = Dict{String,String}()
+    for (name, graph) in REVERSE_CRYSTALNETS_ARCHIVE
+        root = split(name, ',')[1]
+        (root[end] == 'a' && root[end-1] == '-') || continue
+        root = root[1:end-2]
+        haskey(REVERSE_CRYSTALNETS_ARCHIVE, root) && continue
+        newg = deaugment(PeriodicGraph(graph))
+        idx = findfirst(==(root), names)
+        idx isa Nothing && ((@warn "Could not find $root"); continue)
+        if check_graph(newg, unique!(sort(seqss[idx])))
+            genome = string(PeriodicGraph(topological_genome(CrystalNet(newg))))
+            reference = get(CrystalNets.CRYSTALNETS_ARCHIVE, genome, nothing)
+            if reference isa String
+                startswith(reference, root) && continue
+                @error "Found another graph for $root: \"$reference\", \"$genome\""
+            end
+            ret[root] = genome
+        end
+    end
+    ret
+end
+
 """
+    extract_graphs(rcsr=rcsr3D, onlynew=true)
+
 Automatically collect the periodic graph corresponding to the nets in the RCSR.
+
+If `onlynew` is set, only return the graphs that are not already in the CrystalNets archive.
 """
-function extract_graphs(rcsr=rcsr3D)
+function extract_graphs(rcsr=rcsr3D, onlynew=true)
     names, cifvs, cifes, cells, seqss, symmetry_issues = extract_rcsr_data(rcsr)
     n = length(names)
     ret = Vector{Pair{String,PeriodicGraph3D}}(undef, n)
@@ -456,7 +575,7 @@ function extract_graphs(rcsr=rcsr3D)
         seqs = seqss[i]
         graph = try
             determine_graph(cifv, cife, cell, seqs)
-        catch e
+        catch
             push!(errored[threadid()], i)
             continue
         end
@@ -469,10 +588,38 @@ function extract_graphs(rcsr=rcsr3D)
     _failed = reduce(vcat, failed)
     _errored = reduce(vcat, errored)
     toremove = vcat(_failed, _errored)
+    if onlynew
+        for i in 1:length(ret)
+            isassigned(ret, i) || continue
+            name, graph = ret[i]
+            reference_s = get(REVERSE_CRYSTALNETS_ARCHIVE, name, nothing)
+            reference_s isa String || continue
+            genome = string(PeriodicGraph(topological_genome(CrystalNet(graph))))
+            if genome != reference_s
+                @error "Found another graph for $name: \"$reference_s\", \"$genome\""
+            end
+            push!(toremove, i)
+        end
+    end
     sort!(toremove)
     deleteat!(ret, toremove)
 
-    return Dict(ret), names[_failed], names[_errored], symmetry_issues
+    retdict = Dict(ret)
+    remove_from_failed = Int[]
+    for failed_i in _failed
+        name = names[failed_i]
+        graph = get(retdict, string(name, "-a"), nothing)
+        if graph isa PeriodicGraph
+            newg = deaugment(graph)
+            if check_graph(newg, unique!(sort(seqss[failed_i])))
+                retdict[name] = newg
+                @show name
+                push!(remove_from_failed, failed_i)
+            end
+        end
+    end
+    deleteat!(_failed, remove_from_failed)
+    return retdict, names[_failed], names[_errored], symmetry_issues
 end
 
 """
@@ -484,6 +631,7 @@ function export_new_archive(path, rcsr=rcsr3D)
     n = length(list_archive)
     ret = Vector{Tuple{String,String}}(undef, n)
     keep = trues(n)
+    println("EXPORTING")
     @threads for i in 1:n
         id, graph = list_archive[i]
         g = topological_genome(CrystalNet(graph))
