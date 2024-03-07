@@ -14,5 +14,6 @@ for file in readdir(".");
 end
 close(w)
 println("git-tree-sha1: ", Tar.tree_hash(IOBuffer(inflate_gzip("/home/liozou/.julia/dev/CrystalNetsArchive/archives.tar.gz"))));
+rm("/home/liozou/.julia/dev/CrystalNetsArchive/archives.tar.gz")
 println("sha256 (tar.xz): ", bytes2hex(open(sha256, "/home/liozou/.julia/dev/CrystalNetsArchive/archives.tar.xz")));
 println("sha256 (zip): ", bytes2hex(open(sha256, "/home/liozou/.julia/dev/CrystalNetsArchive/archives.zip")));
