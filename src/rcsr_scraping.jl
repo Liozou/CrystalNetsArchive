@@ -4,10 +4,56 @@ using Base.Threads
 CrystalNets.toggle_warning(false)
 CrystalNets.toggle_export(false)
 
-import CrystalNets: periodic_distance, expand_symmetry, Cell, CIF, export_arc
+import CrystalNets: expand_symmetry, Cell, CIF, export_arc
+
+function cell_parameters(mat::AbstractMatrix)
+    _a, _b, _c = eachcol(mat)
+    a = norm(_a)
+    b = norm(_b)
+    c = norm(_c)
+    α = acosd(_b'_c/(b*c))
+    β = acosd(_c'_a/(c*a))
+    γ = acosd(_a'_b/(a*b))
+    return (a, b, c), (α, β, γ)
+end
+function prepare_periodic_distance_computations(mat)
+    (a, b, c), (α, β, γ) = cell_parameters(mat)
+    ortho = all(x -> isapprox(Float16(x), 90; rtol=0.02), (α, β, γ))
+    _a, _b, _c = eachcol(mat)
+    safemin = min(Float64(dot(cross(_b, _c), _a)/(b*c)),
+                  Float64(dot(cross(_c, _a), _b)/(a*c)),
+                  Float64(dot(cross(_a, _b), _c)/(a*b)))/2
+    # safemin is the half-distance between opposite planes of the unit cell
+    return MVector{3,Float64}(undef), ortho, safemin
+end
+function periodic_distance!(buffer, u, mat, ortho, safemin)
+    @simd for i in 1:3
+        diff = u[i] + 0.5
+        buffer[i] = diff - floor(diff) - 0.5
+    end
+    ref = norm(mat*buffer)
+    (ortho || ref ≤ safemin) && return ref
+    @inbounds for i in 1:3
+        buffer[i] += 1
+        newnorm = norm(mat*buffer)
+        newnorm < ref && return newnorm # in a reduced lattice, there should be at most one
+        buffer[i] -= 2
+        newnorm = norm(mat*buffer)
+        newnorm < ref && return newnorm
+        buffer[i] += 1
+    end
+    return ref
+end
+periodic_distance!(u, mat, ortho, safemin) = periodic_distance!(u, u, mat, ortho, safemin)
+function periodic_distance(u, mat, ortho=nothing, safemin=nothing)
+    if ortho === nothing || safemin === nothing
+        _, ortho, safemin = prepare_periodic_distance_computations(mat)
+    end
+    periodic_distance!(similar(u), u, mat, ortho::Bool, safemin::Float64)
+end
 
 function getrcsr(n)
-    rcsr = String(HTTP.get("http://rcsr.anu.edu.au/data/$(n)dall.txt").body)
+    rcsr = String(HTTP.get("http://rcsr.net/data/$(n)dall.txt").body)
     return split(rcsr[match(r"start", rcsr).offset:end], r"(\r\n|\n)")
 end
 
@@ -95,7 +141,7 @@ The number of closest neighbours returned is at most `maxsize`.
 Distances between closest neighbours of `x` cannot differ by more than `ε`
 """
 function closest_positions(x, mat, poss, ε, maxsize)
-    _, ortho, _safemin = CrystalNets.prepare_periodic_distance_computations(mat)
+    _, ortho, _safemin = prepare_periodic_distance_computations(mat)
     safemin = 6*_safemin/7
     buffer = MVector{3,Float32}(undef)
     closest_pos = SVector{3,Float32}[]
@@ -379,7 +425,7 @@ function extract_rcsr_data(rcsr=rcsr3D)
         try
             weaving = false
             for j in 1:5
-                name ∈ ("cdz-e", "ssf-e", "bor-y", "pok", "qok") || @assert rcsr[i][1] == ' '
+                name ∈ ("cdz-e", "ssf-e", "bor-y", "pok", "qok", "sfo", "rok") || @assert rcsr[i][1] == ' '
                 splits = split(rcsr[i])
                 num = parse(Int, first(splits))
                 if j == 4
@@ -435,9 +481,9 @@ function extract_rcsr_data(rcsr=rcsr3D)
             for e in 1:nume
                 splits = split(rcsr[i], x -> isspace(x) || !isprint(x); keepempty=false)
                 @assert splits[2] == "2"
-                name ∈ ("ntb", "bcu-dia-c", "oku") || splits[1] == "E"*string(e) || @warn "$(splits[1]) != E$e"
+                name ∈ ("ntb", "bcu-dia-c", "oku") || splits[1] == "E"*string(e) || @warn "$(splits[1]) != E$e for $name"
                 i += 1
-                pose[:, e] .= parse.(Float64, split(rcsr[i]))
+                pose[:, e] .= try parse.(Float64, split(rcsr[i])) catch; NaN end
                 i += 4
             end
 
